@@ -1,9 +1,11 @@
 {-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TupleSections              #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Kafka.Avro.SchemaRegistry
 ( schemaRegistry, loadSchema, sendSchema
@@ -18,6 +20,7 @@ module Kafka.Avro.SchemaRegistry
 , cfgAuth
 , cfgHeaders
 , cfgAutoRegisterSchemas
+, cfgUseLatestSchemaVersion
 , SchemaId(..), Subject(..)
 , SchemaRegistryConfig
 , SchemaRegistry, SchemaRegistryError(..)
@@ -66,6 +69,11 @@ newtype Subject = Subject { unSubject :: Text} deriving (Eq, Show, IsString, Ord
 newtype RegisteredSchema = RegisteredSchema { unRegisteredSchema :: Schema} deriving (Generic, Show)
 
 newtype Version = Version { unVersion :: Word32 } deriving (Eq, Ord, Show, Hashable)
+data QueryVersion = SpecificVersion Version | LatestVersion
+renderQueryVersion :: QueryVersion -> String
+renderQueryVersion = \case
+    SpecificVersion (Version version) -> show version
+    LatestVersion -> "latest"
 
 data Compatibility = NoCompatibility
                    | FullCompatibility
@@ -77,6 +85,7 @@ data SchemaRegistryConfig = SchemaRegistryConfig
   { cAuth                :: Maybe Wreq.Auth
   , cExtraHeaders        :: [Header]
   , cAutoRegisterSchemas :: Bool
+  , cUseLatestSchemaVersion :: Bool
   }
 
 data SchemaRegistry = SchemaRegistry
@@ -101,6 +110,7 @@ defaultSchemaRegistryConfig = SchemaRegistryConfig
   { cAuth = Nothing
   , cExtraHeaders = []
   , cAutoRegisterSchemas = True
+  , cUseLatestSchemaVersion = False
   }
 
 schemaRegistry :: MonadIO m => String -> m SchemaRegistry
@@ -136,6 +146,11 @@ cfgHeaders headers config = config { cExtraHeaders = headers }
 cfgAutoRegisterSchemas :: Bool -> SchemaRegistryConfig -> SchemaRegistryConfig
 cfgAutoRegisterSchemas autoRegisterSchemas config = config { cAutoRegisterSchemas = autoRegisterSchemas }
 
+-- | When auto-registration of schemas is disabled, pick the latest version instead of using compatibility testing.
+-- This is similar to the Confluent 'use.latest.version' option.
+cfgUseLatestSchemaVersion :: Bool -> SchemaRegistryConfig -> SchemaRegistryConfig
+cfgUseLatestSchemaVersion useLatestSchemaVersion config = config { cUseLatestSchemaVersion = useLatestSchemaVersion }
+
 loadSchema :: MonadIO m => SchemaRegistry -> SchemaId -> m (Either SchemaRegistryError Schema)
 loadSchema sr sid = do
   sc <- cachedSchema sr sid
@@ -146,8 +161,11 @@ loadSchema sr sid = do
       traverse ((\schema -> schema <$ cacheSchema sr sid schema) . unRegisteredSchema) res
 
 loadSubjectSchema :: MonadIO m => SchemaRegistry -> Subject -> Version -> m (Either SchemaRegistryError Schema)
-loadSubjectSchema sr (Subject sbj) (Version version) = do
-    let url = srBaseUrl sr ++ "/subjects/" ++ unpack sbj ++ "/versions/" ++ show version
+loadSubjectSchema registry subject version = fmap snd <$> loadSubjectSchema' registry subject (SpecificVersion version)
+
+loadSubjectSchema' :: MonadIO m => SchemaRegistry -> Subject -> QueryVersion -> m (Either SchemaRegistryError (SchemaId, Schema))
+loadSubjectSchema' sr subject version = do
+    let url = srBaseUrl sr ++ "/subjects/" ++ unpack (unSubject subject) ++ "/versions/" ++ renderQueryVersion version
     respE   <- liftIO . try $ Wreq.getWith (wreqOpts sr) url
     case respE of
       Left exc -> pure . Left $ wrapErrorWithUrl url exc
@@ -159,7 +177,10 @@ loadSubjectSchema sr (Subject sbj) (Version version) = do
 
         case (,) <$> schema <*> schemaId of
           Left err                                  -> return $ Left err
-          Right (RegisteredSchema schema, schemaId) -> cacheSchema sr schemaId schema $> Right schema
+          Right (RegisteredSchema schema, schemaId) -> do
+            cacheId sr subject (fullTypeName schema) schemaId
+            cacheSchema sr schemaId schema
+            pure $ Right (schemaId, schema)
   where
 
     getData :: (MonadIO m, FromJSON a) => String -> Either e Value -> m (Either e a)
@@ -187,9 +208,10 @@ sendSchema sr subj sc = do
   sid <- cachedId sr subj schemaName
   case sid of
     Just sid' -> return (Right sid')
-    Nothing -> if cAutoRegisterSchemas (srConfig sr)
-                then registerSchema sr subj sc
-                else getCompatibleSchema sr subj sc
+    Nothing -> case srConfig sr of
+        (cAutoRegisterSchemas -> True) -> registerSchema sr subj sc
+        (cUseLatestSchemaVersion -> True) -> fmap fst <$> loadSubjectSchema' sr subj LatestVersion
+        _ -> getCompatibleSchema sr subj sc
 
 registerSchema :: MonadIO m => SchemaRegistry -> Subject -> Schema -> m (Either SchemaRegistryError SchemaId)
 registerSchema sr subj sc = do
